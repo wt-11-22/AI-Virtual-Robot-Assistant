@@ -50,7 +50,7 @@ The project is currently under active development. The current implementation in
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/AI-Virtual-Robot-Assistant.git
+git clone https://github.com/wt-11-22/AI-Virtual-Robot-Assistant.git
 cd AI-Virtual-Robot-Assistant
 ```
 
