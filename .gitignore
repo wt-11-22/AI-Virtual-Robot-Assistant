@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+.env
+camera_error.txt
+camera_test.jpg
