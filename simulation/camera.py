@@ -1,24 +1,49 @@
 
 from pathlib import Path
-import onnxruntime as ort
+import sys
 import time
-import math
+import threading
+import queue
+
+import onnxruntime as ort
 import pybullet as p
-import pybullet_data
 import cv2
 import numpy as np
 
 
 # ==========================================
-# YOLO 模型初始化
+# 1. 添加项目根目录
+# ==========================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ==========================================
+# 2. 导入统一控制接口
+# ==========================================
+
+from robot.robot_controller import RobotController
+from robot.keyboard_controller import KeyboardController
+
+
+# ==========================================
+# 3. YOLO 模型初始化
 # ==========================================
 
 YOLO_MODEL_PATH = (
-    Path(__file__).resolve().parents[1]
+    PROJECT_ROOT
     / "vision"
     / "models"
     / "yolov8n.onnx"
 )
+
+if not YOLO_MODEL_PATH.exists():
+    raise FileNotFoundError(
+        "找不到 YOLO 模型: {}".format(YOLO_MODEL_PATH)
+    )
 
 yolo_session = ort.InferenceSession(
     str(YOLO_MODEL_PATH),
@@ -31,45 +56,28 @@ print("YOLO 模型加载成功")
 
 
 # ==========================================
-# 1. 仿真环境
+# 4. 启动机器人和键盘控制器
 # ==========================================
 
-physics_client = p.connect(p.GUI)
+robot = RobotController()
+keyboard_controller = KeyboardController()
 
-p.setAdditionalSearchPath(pybullet_data.getDataPath())
-p.setAdditionalSearchPath(r"C:\pybullet_data")
+robot.start()
 
-p.setGravity(0, 0, -9.8)
-p.setTimeStep(1.0 / 240.0)
-p.setRealTimeSimulation(0)
+robot_id = robot.robot_id
 
-p.loadURDF("plane.urdf")
+print("Laikago 机器人启动成功")
 
 
 # ==========================================
-# 2. 加载 Laikago
-# 保持与 main.py 相同的初始姿态
-# ==========================================
-
-robot = p.loadURDF(
-    r"C:\pybullet_data\laikago\laikago_toes.urdf",
-    basePosition=[0, 0, 0.50],
-    baseOrientation=p.getQuaternionFromEuler(
-        [1.5707963, 0, 0]
-    ),
-    useFixedBase=False
-)
-
-
-# ==========================================
-# 3. 查看机器人各部分质量
+# 5. 查看机器人各部分质量
 # ==========================================
 
 total_mass = 0.0
 
-for link_index in range(-1, p.getNumJoints(robot)):
+for link_index in range(-1, p.getNumJoints(robot_id)):
 
-    dynamics = p.getDynamicsInfo(robot, link_index)
+    dynamics = p.getDynamicsInfo(robot_id, link_index)
 
     mass = dynamics[0]
     total_mass += mass
@@ -85,165 +93,30 @@ print("=" * 40)
 
 
 # ==========================================
-# 4. 四足机器人关节与步态初始化
-# ==========================================
-
-leg_groups = {
-    "FR": [0, 1, 2],
-    "FL": [4, 5, 6],
-    "RR": [8, 9, 10],
-    "RL": [12, 13, 14]
-}
-
-default_angles = [0, 0.7, -1.4]
-
-
-def set_leg_angles(leg, angles, force=100):
-
-    p.setJointMotorControlArray(
-        bodyUniqueId=robot,
-        jointIndices=leg_groups[leg],
-        controlMode=p.POSITION_CONTROL,
-        targetPositions=angles,
-        forces=[force] * 3,
-        positionGains=[0.2] * 3,
-        velocityGains=[1.0] * 3
-    )
-
-
-def stand():
-
-    for leg in leg_groups:
-        set_leg_angles(leg, default_angles)
-
-
-# 初始化关节角度
-for leg in leg_groups:
-
-    for index, angle in zip(
-        leg_groups[leg],
-        default_angles
-    ):
-
-        p.resetJointState(
-            robot,
-            index,
-            angle
-        )
-
-stand()
-
-
-# 设置四个脚掌的摩擦力
-toe_links = {
-    "FR": 3,
-    "FL": 7,
-    "RR": 11,
-    "RL": 15
-}
-
-for link in toe_links.values():
-
-    p.changeDynamics(
-        robot,
-        link,
-        lateralFriction=1.5,
-        spinningFriction=0.02
-    )
-
-
-# 稳定初始姿态
-for _ in range(240):
-    p.stepSimulation()
-
-
-# ==========================================
-# 5. 四足机器人步态控制算法
-# ==========================================
-
-GAIT_PERIOD = 1.2
-
-HIP_SWING = 0.15
-
-KNEE_SWING = 0.20
-
-leg_phase_offset = {
-    "FR": 0.0,
-    "RL": 0.0,
-    "FL": math.pi,
-    "RR": math.pi
-}
-
-gait_phase = 0.0
-
-
-def control_leg(leg, phase, turn):
-
-    if turn > 0:
-        side_factor = 1.0 if leg in ["FR", "RR"] else 0.65
-
-    elif turn < 0:
-        side_factor = 1.0 if leg in ["FL", "RL"] else 0.65
-
-    else:
-        side_factor = 1.0
-
-    leg_phase = phase + leg_phase_offset[leg]
-
-    hip_offset = (
-        HIP_SWING *
-        side_factor *
-        math.sin(leg_phase)
-    )
-
-    knee_offset = (
-        KNEE_SWING *
-        side_factor *
-        (1.0 - math.cos(leg_phase)) / 2.0
-    )
-
-    target_angles = [
-        default_angles[0],
-        default_angles[1] + hip_offset,
-        default_angles[2] - knee_offset
-    ]
-
-    set_leg_angles(
-        leg,
-        target_angles,
-        force=100
-    )
-
-
-def control_gait(phase, turn):
-
-    for leg in leg_groups:
-        control_leg(leg, phase, turn)
-
-
-# ==========================================
 # 6. 加载真实盆栽模型
 # ==========================================
 
-PLANT_MODEL_DIR = r"C:\robot_assets\plant"
+PLANT_MODEL_DIR = Path(r"C:\robot_assets\plant")
 
-p.setAdditionalSearchPath(PLANT_MODEL_DIR)
-
-plant_model_file = Path(PLANT_MODEL_DIR) / "plant_pybullet.obj"
+plant_model_file = (
+    PLANT_MODEL_DIR / "plant_pybullet.obj"
+)
 
 if not plant_model_file.exists():
+    robot.close()
     raise FileNotFoundError(
         "找不到盆栽模型: {}".format(plant_model_file)
     )
 
 plant_visual = p.createVisualShape(
     shapeType=p.GEOM_MESH,
-    fileName="plant_pybullet.obj",
+    fileName=str(plant_model_file),
     meshScale=[0.8, 0.8, 0.8],
     rgbaColor=[1, 1, 1, 1]
 )
 
 if plant_visual < 0:
+    robot.close()
     raise RuntimeError("盆栽 OBJ 模型加载失败！")
 
 plant = p.createMultiBody(
@@ -347,8 +220,15 @@ def yolo_detect(image):
 
     class_scores_all = predictions[:, 4:]
 
-    max_confidence = float(np.max(class_scores_all))
-    best_index = int(np.argmax(np.max(class_scores_all, axis=1)))
+    max_confidence = float(
+        np.max(class_scores_all)
+    )
+
+    best_index = int(
+        np.argmax(
+            np.max(class_scores_all, axis=1)
+        )
+    )
 
     best_class_id = int(
         np.argmax(class_scores_all[best_index])
@@ -501,11 +381,13 @@ CAMERA_UP = [0.0, 1.0, 0.0]
 
 def get_camera_matrices():
 
-    base_position, base_orientation = p.getBasePositionAndOrientation(
-        robot
+    base_position, base_orientation = (
+        p.getBasePositionAndOrientation(robot_id)
     )
 
-    rotation = p.getMatrixFromQuaternion(base_orientation)
+    rotation = p.getMatrixFromQuaternion(
+        base_orientation
+    )
 
     rotation = np.array(rotation).reshape(3, 3)
 
@@ -601,208 +483,350 @@ def estimate_object_distance(depth_image, box):
 
 
 # ==========================================
-# 15. 实时显示与机器人键盘控制
+# 15. 视觉线程：YOLO 后台检测
 # ==========================================
 
-print("Laikago Camera Started")
-print("YOLO Object Detection Started")
-print("Press Q to exit.")
-print("W: 前进 | S: 后退 | A: 左转 | D: 右转")
-print("SPACE: 停止")
+# 队列最多保留一张待检测图片。
+# 如果旧图片还没有处理完，就用最新图片替换。
+yolo_queue = queue.Queue(maxsize=1)
 
-detection_results = []
+yolo_stop_event = threading.Event()
 
-frame_count = 0
-DETECTION_INTERVAL = 10
+# 保存最新检测结果及其对应的深度图
+yolo_result_lock = threading.Lock()
 
-last_time = time.time()
+shared_detection_data = {
+    "results": [],
+    "depth": None,
+    "timestamp": 0.0,
+    "version": 0
+}
 
-walk_mode = 0
-turn_mode = 0
 
+def yolo_worker():
 
-try:
+    print("YOLO 后台检测线程启动")
 
-    while p.isConnected():
+    while not yolo_stop_event.is_set():
 
-        # PyBullet 键盘事件读取
-        keys = p.getKeyboardEvents()
+        try:
+            image, depth_image = yolo_queue.get(timeout=0.1)
 
-        def is_down(key):
+        except queue.Empty:
+            continue
 
-            return (
-                key in keys and
-                bool(keys[key] & p.KEY_IS_DOWN)
-            )
+        try:
 
-        w_down = is_down(ord('w'))
-        s_down = is_down(ord('s'))
-        a_down = is_down(ord('a'))
-        d_down = is_down(ord('d'))
+            # YOLO 推理只在后台线程执行
+            results = yolo_detect(image)
 
-        space_down = is_down(
-            getattr(p, "B3G_SPACE", 32)
-        )
+            # 计算每个目标的距离
+            for result in results:
 
-        # 根据按键确定运动模式
-        if space_down:
-
-            walk_mode = 0
-            turn_mode = 0
-
-        else:
-
-            if w_down:
-                walk_mode = 1
-            elif s_down:
-                walk_mode = -1
-            else:
-                walk_mode = 0
-
-            if a_down:
-                turn_mode = 1
-            elif d_down:
-                turn_mode = -1
-            else:
-                turn_mode = 0
-
-        # 更新步态相位
-        now = time.time()
-
-        dt = min(now - last_time, 0.02)
-
-        last_time = now
-
-        if walk_mode != 0 or turn_mode != 0:
-
-            direction = walk_mode
-
-            if direction == 0:
-                direction = 1
-
-            gait_phase += (
-                direction *
-                2.0 *
-                math.pi *
-                dt /
-                GAIT_PERIOD
-            )
-
-            gait_phase %= 2.0 * math.pi
-
-            control_gait(
-                gait_phase,
-                turn_mode
-            )
-
-        else:
-
-            stand()
-
-        # 执行物理仿真
-        p.stepSimulation()
-
-        # 获取 RGB 和深度图
-        rgb_image, depth_image = capture_camera()
-
-        # 保存第一帧摄像头图片
-        if frame_count == 0:
-
-            cv2.imwrite(
-                "camera_test.jpg",
-                rgb_image
-            )
-
-            print("摄像头图片已保存：camera_test.jpg")
-
-        frame_count += 1
-
-        # 定期执行 YOLO 检测
-        if frame_count % DETECTION_INTERVAL == 0:
-
-            detection_results = yolo_detect(rgb_image)
-
-            if detection_results:
-
-                print(
-                    "检测到 {} 个物体".format(
-                        len(detection_results)
-                    )
+                distance = estimate_object_distance(
+                    depth_image,
+                    result["box"]
                 )
 
-                for result in detection_results:
+                result["distance"] = distance
+
+            # 更新共享检测结果
+            with yolo_result_lock:
+
+                shared_detection_data["results"] = results
+                shared_detection_data["depth"] = depth_image
+                shared_detection_data["timestamp"] = time.time()
+                shared_detection_data["version"] += 1
+
+            if len(results) == 0:
+
+                print("YOLO：当前没有检测到目标")
+
+            else:
+
+                for result in results:
 
                     class_name = YOLO_CLASSES[
                         result["class_id"]
                     ]
 
-                    confidence = result["confidence"]
+                    distance = result.get("distance")
 
-                    distance = estimate_object_distance(
-                        depth_image,
-                        result["box"]
-                    )
-
-                    if distance is not None:
-
-                        print(
-                            "物体：{} | 置信度：{:.2f} | 距离：{:.2f} 米".format(
-                                class_name,
-                                confidence,
-                                distance
-                            )
-                        )
+                    if distance is None:
+                        distance_text = "未知"
 
                     else:
-
-                        print(
-                            "物体：{} | 无法获取有效距离".format(
-                                class_name
-                            )
+                        distance_text = "{:.2f} 米".format(
+                            distance
                         )
 
-        # 绘制检测框
-        display_image = yolo_draw(
-            rgb_image.copy(),
-            detection_results
-        )
+                    print(
+                        "检测目标：{} | 置信度：{:.2f} | 距离：{}".format(
+                            class_name,
+                            result["confidence"],
+                            distance_text
+                        )
+                    )
 
-        cv2.imshow(
-            "Robot Dog - YOLO Detection",
-            display_image
-        )
+        except Exception as error:
 
-        # 深度图显示
-        depth_display = np.clip(
-            depth_image / FAR * 255,
-            0,
-            255
-        ).astype(np.uint8)
+            print("YOLO 检测线程发生错误:", error)
 
-        depth_display = cv2.applyColorMap(
-            depth_display,
-            cv2.COLORMAP_JET
-        )
+        finally:
+            yolo_queue.task_done()
 
-        cv2.imshow(
-            "Robot Dog - Depth Camera",
-            depth_display
-        )
+    print("YOLO 后台检测线程退出")
 
-        # 退出检测
-        key = cv2.waitKey(1) & 0xFF
 
-        if key == ord("q"):
+# ==========================================
+# 16. 启动 YOLO 后台线程
+# ==========================================
+
+yolo_thread = threading.Thread(
+    target=yolo_worker,
+    name="YOLO-Worker",
+    daemon=True
+)
+
+yolo_thread.start()
+
+
+# ==========================================
+# 17. 运行参数
+# ==========================================
+
+# 每隔多少次机器人控制循环采集一次摄像头
+CAMERA_INTERVAL = 4
+
+# 两次 YOLO 图片提交之间至少间隔多少秒
+DETECTION_INTERVAL_SECONDS = 0.5
+
+frame_count = 0
+
+last_detection_submit_time = 0.0
+
+display_results = []
+
+last_result_version = 0
+
+last_rgb = None
+last_depth = None
+
+
+# ==========================================
+# 18. 键盘控制说明
+# ==========================================
+
+print("\n========== AI Virtual Robot Assistant ==========")
+print("W：前进")
+print("S：后退")
+print("A：左转")
+print("D：右转")
+print("Q：原地左旋转")
+print("E：原地右旋转")
+print("SPACE：停止")
+print("ESC：退出")
+print("-----------------------------------------------")
+print("RGB 摄像头：已启用")
+print("深度摄像头：已启用")
+print("YOLO 目标检测：后台线程运行")
+print("注意：操作时让 PyBullet 窗口处于焦点状态")
+print("================================================")
+
+
+# ==========================================
+# 19. 主循环：机器人运动优先
+# ==========================================
+
+try:
+
+    while p.isConnected():
+
+        # ----------------------------------
+        # A. 读取键盘
+        # ----------------------------------
+
+        command = keyboard_controller.get_command()
+
+        if command["exit"]:
             break
+
+        if command["stop"]:
+
+            robot.stop()
+
+        else:
+
+            robot.set_motion(
+                walk=command["walk"],
+                turn=command["turn"],
+                spin=command["spin"]
+            )
+
+        # ----------------------------------
+        # B. 优先更新机器人
+        # ----------------------------------
+
+        robot.update()
+
+        frame_count += 1
+
+        # ----------------------------------
+        # C. 定期采集摄像头
+        # ----------------------------------
+
+        if frame_count % CAMERA_INTERVAL == 0:
+
+            rgb_image, depth_image = capture_camera()
+
+            last_rgb = rgb_image
+            last_depth = depth_image
+
+            # ----------------------------------
+            # D. 定期向 YOLO 后台线程提交图片
+            # ----------------------------------
+
+            current_time = time.time()
+
+            if (
+                current_time - last_detection_submit_time
+                >= DETECTION_INTERVAL_SECONDS
+            ):
+
+                image_copy = rgb_image.copy()
+                depth_copy = depth_image.copy()
+
+                try:
+
+                    # 尝试直接放入队列
+                    yolo_queue.put_nowait(
+                        (image_copy, depth_copy)
+                    )
+
+                    last_detection_submit_time = current_time
+
+                except queue.Full:
+
+                    # 如果旧图片还没处理完，丢弃旧图片
+                    # 优先保留最新摄像头画面
+                    try:
+                        yolo_queue.get_nowait()
+                        yolo_queue.task_done()
+
+                    except queue.Empty:
+                        pass
+
+                    try:
+
+                        yolo_queue.put_nowait(
+                            (image_copy, depth_copy)
+                        )
+
+                        last_detection_submit_time = current_time
+
+                    except queue.Full:
+                        pass
+
+        # ----------------------------------
+        # E. 读取后台线程的最新检测结果
+        # ----------------------------------
+
+        with yolo_result_lock:
+
+            if (
+                shared_detection_data["version"]
+                != last_result_version
+            ):
+
+                display_results = [
+                    dict(item)
+                    for item in shared_detection_data["results"]
+                ]
+
+                last_result_version = (
+                    shared_detection_data["version"]
+                )
+
+        # ----------------------------------
+        # F. 显示 RGB 和 YOLO 检测窗口
+        # ----------------------------------
+
+        if last_rgb is not None:
+
+            display_image = last_rgb.copy()
+
+            display_image = yolo_draw(
+                display_image,
+                display_results
+            )
+
+            cv2.imshow(
+                "Robot RGB + YOLO Detection",
+                display_image
+            )
+
+        # ----------------------------------
+        # G. 显示深度图
+        # ----------------------------------
+
+        if last_depth is not None:
+
+            depth_display = np.clip(
+                last_depth / FAR * 255,
+                0,
+                255
+            ).astype(np.uint8)
+
+            depth_display = cv2.applyColorMap(
+                depth_display,
+                cv2.COLORMAP_JET
+            )
+
+            cv2.imshow(
+                "Robot Depth Camera",
+                depth_display
+            )
+
+        # ----------------------------------
+        # H. 处理 OpenCV 窗口事件
+        # ----------------------------------
+
+        cv2.waitKey(1)
+
+        # ----------------------------------
+        # I. 控制循环休眠
+        # ----------------------------------
 
         time.sleep(1.0 / 240.0)
 
 
+except KeyboardInterrupt:
+
+    print("\n用户中断仿真。")
+
+
+except Exception as error:
+
+    print("\n主程序发生错误:", error)
+
+
 finally:
+
+    # ======================================
+    # 20. 安全关闭程序
+    # ======================================
+
+    print("\n正在关闭视觉系统...")
+
+    yolo_stop_event.set()
+
+    if yolo_thread.is_alive():
+
+        yolo_thread.join(timeout=2.0)
 
     cv2.destroyAllWindows()
 
-    if p.isConnected():
-        p.disconnect()
+    robot.close()
 
-    print("Camera closed.")
+    print("机器人仿真已关闭。")
+    print("视觉系统已关闭。")
